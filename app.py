@@ -252,7 +252,7 @@ st.markdown("Generate, refine, merge, and efficiently classify survey data with 
 
 with st.sidebar:
     st.header("1. Setup")
-    api_key_input = st.text_input("Enter your OpenAI API Key", type="password", value = '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')
+    api_key_input = st.text_input("Enter your OpenAI API Key", type="password")
     if api_key_input: st.session_state.api_key = api_key_input
     uploaded_file = st.file_uploader("Upload survey data", type=['csv', 'xlsx'])
     if uploaded_file and st.session_state.df is None:
@@ -485,6 +485,16 @@ else:
     if st.session_state.classified_df is not None:
         st.divider()
         st.header("5. View and Download Results")
+        # Normalize separator to pipe for multi-label results (backward compatibility with older runs)
+        if 'Assigned Code' in st.session_state.classified_df.columns:
+            try:
+                series = st.session_state.classified_df['Assigned Code']
+                if pd.api.types.is_object_dtype(series):
+                    needs_conversion = series.fillna("").str.contains(",").any()
+                    if needs_conversion:
+                        st.session_state.classified_df['Assigned Code'] = series.fillna("").str.replace(r'\s*,\s*', ' | ', regex=True)
+            except Exception:
+                pass
         # Only show the original coded column and the assigned code
         col_to_show = st.session_state.get('column_to_code', None)
         if not col_to_show:
