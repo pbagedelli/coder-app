@@ -7,6 +7,7 @@ import json
 import numpy as np
 from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import normalize
+import re
 
 # --- Pydantic Models ---
 class Code(BaseModel):
@@ -17,18 +18,28 @@ class Code(BaseModel):
 class Codebook(BaseModel):
     codes: list[Code] = Field(..., description="The complete list of generated codes for the survey question.")
 
-# --- NEW: Pydantic model for multi-label classification output ---
-class ClassificationResult(BaseModel):
-    assigned_codes: list[str] = Field(..., description="A list of one or more code labels from the provided codebook that apply to the response. Return an empty list if no codes apply.")
+# --- Classification output models (single and multi-label share the same shape) ---
+class ClassificationEvidence(BaseModel):
+    label: str = Field(..., description="The code label from the codebook")
+    fragment: str = Field(..., description="The exact fragment of the response that supports this code")
+    pertinence: float = Field(..., ge=0.0, le=1.0, description="Pertinence score between 0 and 1")
+    explanation: str | None = Field(default=None, description="Brief explanation of why the fragment maps to the code")
+
+class ClassificationOutput(BaseModel):
+    items: list[ClassificationEvidence] = Field(default_factory=list, description="List of assigned codes with supporting evidence")
+
+class UncoveredReview(BaseModel):
+    uncovered: list[int] = Field(default_factory=list, description="0-based indices of responses with no applicable codes")
 
 # --- Page Configuration ---
-st.set_page_config(page_title="Intelligent Survey Coder", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="Intelligent Survey Coder", page_icon="", layout="wide")
 
 # --- State Management ---
 def initialize_state():
     for key, value in {
         'api_key': None, 'df': None, 'structured_codebook': None,
-        'classified_df': None, 'question_text': "", 'initial_sample_size': 0
+        'classified_df': None, 'question_text': "", 'initial_sample_size': 0,
+        'codebook_upload_nonce': 0
     }.items():
         if key not in st.session_state: st.session_state[key] = value
 
@@ -70,16 +81,38 @@ def create_merge_prompt(codebook1_json: str, codebook2_json: str, user_instructi
         prompt += f"""\n\n**CRITICAL USER INSTRUCTIONS:**\nYou MUST follow these instructions. They override general guidance.\n---\n{user_instructions}\n---"""
     return prompt
 
-def classify_response_prompt(question, response, codebook_text):
-    return f"""Classify the response based on the codebook. Choose the single best code label.
-    **Question:** "{question}" **Codebook:**\n---\n{codebook_text}\n--- **Response:** "{response}"
-    **Your output must be ONLY the code label.**"""
+def classify_response_prompt(question, response, codebook_text, include_explanation: bool = True):
+    explanation_field = ', "explanation": string' if include_explanation else ''
+    explanation_note = '' if include_explanation else '\n    Do NOT include an "explanation" field.'
+    return f"""Classify the response based on the codebook. Choose the single best code and provide evidence.
+    Question: "{question}"
+    Codebook:\n---\n{codebook_text}\n---
+    Response: "{response}"
+    Return ONLY a JSON object with this schema:
+    {{
+      "items": [
+        {{ "label": string, "fragment": string, "pertinence": number (0-1){explanation_field} }}
+      ]
+    }}{explanation_note}
+    For single-label, the list MUST contain exactly one item.
+    """
 
 # --- NEW: Prompt for multi-label classification ---
-def classify_response_prompt_multi(question, response, codebook_text):
+def classify_response_prompt_multi(question, response, codebook_text, include_explanation: bool = True):
+    explanation_field = ', "explanation": string' if include_explanation else ''
+    explanation_note = '' if include_explanation else '\n    Do NOT include an "explanation" field.'
     return f"""Analyze the response and identify ALL themes from the codebook that are present.
-    **Question:** "{question}" **Codebook:**\n---\n{codebook_text}\n--- **Response:** "{response}"
-    **Instructions:** Return a list of all applicable code labels. If no codes apply, return an empty list."""
+    Question: "{question}"
+    Codebook:\n---\n{codebook_text}\n---
+    Response: "{response}"
+    Return ONLY a JSON object with this schema:
+    {{
+      "items": [
+        {{ "label": string, "fragment": string, "pertinence": number (0-1){explanation_field} }}
+      ]
+    }}{explanation_note}
+    If no codes apply, return {{ "items": [] }}.
+    """
 
 def get_embeddings(texts: list[str], api_key: str, model="text-embedding-3-small"):
     client = OpenAI(api_key=api_key)
@@ -178,6 +211,21 @@ def parse_uploaded_codebook(uploaded_file):
     return None
 
 # --- Helpers for robust merging ---
+def normalize_codebook(cb: Codebook) -> Codebook:
+    try:
+        normalized_codes = []
+        for item in (cb.codes or []):
+            code_label = str(getattr(item, 'code', '') or '').strip()
+            code_desc = str(getattr(item, 'description', '') or '').strip()
+            raw_examples = getattr(item, 'examples', []) or []
+            if not isinstance(raw_examples, (list, tuple)):
+                raw_examples = [str(raw_examples)]
+            examples = [str(x).strip() for x in raw_examples if str(x).strip()]
+            normalized_codes.append(Code(code=code_label, description=code_desc, examples=examples))
+        return Codebook(codes=normalized_codes)
+    except Exception:
+        return cb
+
 def serialize_codebook_for_prompt(codebook_obj: Codebook) -> str:
     try:
         payload = {
@@ -246,6 +294,33 @@ Current codebook JSON:\n{base_json}\n\nInstructions:\n{instructions}\n\nReturn O
         st.error(f"Failed to parse refined codebook: {e}")
         return None
 
+def propose_new_code_for_response(api_key: str, question: str, response: str, model: str) -> Code | None:
+    system_msg = "You are an expert survey analyst. Propose concise, non-overlapping codes."
+    prompt = f"""The following response does not match any existing code. Propose ONE new code.
+Question: "{question}"
+Response: "{response}"
+Return ONLY JSON with this schema:
+{{ "code": string, "description": string, "examples": string[] }}
+Include the response as the first example.
+"""
+    proposed = call_openai_api(api_key, system_msg, prompt, model=model, pydantic_model=Code)
+    return proposed
+
+def review_uncovered_responses(api_key: str, question: str, responses: list[str], codebook_text: str, model: str) -> list[int]:
+    indexed = "\n".join([f"[{i}] \"{resp}\"" for i, resp in enumerate(responses)])
+    system_msg = "You are a precise survey coding reviewer."
+    prompt = f"""Identify which responses do NOT match any code in the codebook.
+Question: "{question}"
+Codebook:\n---\n{codebook_text}\n---
+Responses (indexed):\n{indexed}\n\nReturn ONLY JSON with this schema and 0-based indices:
+{{ "uncovered": [number, ...] }}
+If all responses are covered, return {{ "uncovered": [] }}.
+"""
+    res = call_openai_api(api_key, system_msg, prompt, model=model, pydantic_model=UncoveredReview)
+    if res and isinstance(res.uncovered, list):
+        return [i for i in res.uncovered if isinstance(i, int) and 0 <= i < len(responses)]
+    return []
+
 # --- UI Layout ---
 st.title("Survey Coder")
 st.markdown("Generate, refine, merge, and efficiently classify survey data with AI.")
@@ -288,24 +363,47 @@ else:
 
     st.divider()
     st.header("3. Generate & Refine Codebook")
-    with st.expander("📥 Import Codebook"):
-        uploaded_cb = st.file_uploader("Upload codebook (JSON or CSV)", type=['json', 'csv'], key="codebook_upload")
-        if uploaded_cb is not None:
-            parsed_cb = parse_uploaded_codebook(uploaded_cb)
-            if parsed_cb and parsed_cb.codes:
-                st.session_state.structured_codebook = parsed_cb
-                st.success(f"Loaded codebook with {len(parsed_cb.codes)} codes.")
-            else:
-                st.warning("Uploaded codebook is empty or invalid.")
-    if st.button("✨ Generate Initial Codebook", use_container_width=True):
-        st.session_state.initial_sample_size = num_examples
-        examples = df[column_to_code].dropna().unique().tolist()[:num_examples]
-        with st.spinner("AI is analyzing responses and generating your codebook..."):
-            prompt = generate_structured_codebook_prompt(st.session_state.question_text, examples)
-            codebook_object = call_openai_api(st.session_state.api_key, "You are an expert survey analyst.", prompt, generation_model, pydantic_model=Codebook)
-            if codebook_object: st.session_state.structured_codebook = codebook_object; st.success("Initial codebook generated!")
+    col_imp, col_gen = st.columns(2)
+    with col_imp:
+        with st.expander("📥 Import Codebook"):
+            uploaded_cb = st.file_uploader(
+                "Upload codebook (JSON or CSV)",
+                type=['json', 'csv'],
+                key=f"codebook_upload_{st.session_state.codebook_upload_nonce}"
+            )
+            import_clicked = st.button("Load Codebook", use_container_width=True)
+            if import_clicked:
+                if uploaded_cb is None:
+                    st.warning("Please select a file to import.")
+                else:
+                    parsed_cb = parse_uploaded_codebook(uploaded_cb)
+                    if parsed_cb and parsed_cb.codes:
+                        parsed_cb = normalize_codebook(parsed_cb)
+                        st.session_state.structured_codebook = parsed_cb
+                        st.session_state.selected_code_index = 0
+                        # Reset selector widget to avoid stale selection after import
+                        try:
+                            if 'code_selector' in st.session_state: del st.session_state['code_selector']
+                        except Exception:
+                            pass
+                        st.success(f"Loaded codebook with {len(parsed_cb.codes)} codes.")
+                        # Clear the uploader by changing its key
+                        st.session_state.codebook_upload_nonce += 1
+                        st.rerun()
+                    else:
+                        st.warning("Uploaded codebook is empty or invalid.")
+    with col_gen:
+        if st.button("✨ Generate Initial Codebook", use_container_width=True):
+            st.session_state.initial_sample_size = num_examples
+            examples = df[column_to_code].dropna().unique().tolist()[:num_examples]
+            with st.spinner("AI is analyzing responses and generating your codebook..."):
+                prompt = generate_structured_codebook_prompt(st.session_state.question_text, examples)
+                codebook_object = call_openai_api(st.session_state.api_key, "You are an expert survey analyst.", prompt, generation_model, pydantic_model=Codebook)
+                if codebook_object: st.session_state.structured_codebook = codebook_object; st.success("Initial codebook generated!")
 
     if st.session_state.structured_codebook:
+        # Ensure imported or previously saved codebooks are normalized for editing
+        st.session_state.structured_codebook = normalize_codebook(st.session_state.structured_codebook)
         # (Editor UI is unchanged)
         st.subheader("Interactive Codebook Editor")
         with st.expander("⬇️ Export Codebook"):
@@ -332,7 +430,10 @@ else:
                 current_item.description = st.text_area("Description", value=current_item.description, key=f"desc_{selected_index}", height=150)
                 st.markdown("");
                 if st.button("🗑️ Delete This Code", use_container_width=True):
-                    st.session_state.structured_codebook.codes.pop(selected_index); st.session_state.selected_code_index = 0; st.rerun()
+                    remaining = [c for i, c in enumerate(st.session_state.structured_codebook.codes) if i != selected_index]
+                    st.session_state.structured_codebook = Codebook(codes=remaining)
+                    st.session_state.selected_code_index = 0
+                    st.rerun()
             with col2:
                 st.markdown(f"#### Examples for '{current_item.code}'")
                 examples_text = "\n".join(current_item.examples) if current_item.examples else ""
@@ -357,6 +458,45 @@ else:
                 if st.form_submit_button("Add Code to Codebook"):
                     if new_code_label: st.session_state.structured_codebook.codes.append(Code(code=new_code_label, description=new_code_desc)); st.success(f"Added new code: '{new_code_label}'"); st.rerun()
                     else: st.warning("Please provide a label for the new code.")
+        with st.expander("🔍 Review a New Sample for Uncovered Texts"):
+            st.markdown("Sample responses not covered by existing labels and propose new codes where needed.")
+            review_n = st.slider("Number of responses to review:", 5, 100, 20, 5)
+            review_model = st.selectbox("Model for review:", ["gpt-4.1", "gpt-4o", "gpt-4.1-mini"], index=0, key="review_model")
+            if st.button("Scan Sample for Uncovered Texts", use_container_width=True):
+                col_to_use = st.session_state.get('column_to_code', None)
+                if not col_to_use or col_to_use not in df.columns:
+                    st.error("No valid column selected for coding.")
+                else:
+                    series = df[col_to_use].dropna().astype(str)
+                    series = series[series.str.strip() != ""]
+                    if series.empty:
+                        st.warning("No responses available.")
+                    else:
+                        actual_n = min(review_n, len(series))
+                        sample_list = series.sample(n=actual_n, replace=False).tolist()
+                        cb_text = reconstruct_codebook_text(st.session_state.structured_codebook)
+                        # Single prompt review of uncovered responses
+                        uncovered_idx = review_uncovered_responses(
+                            api_key=st.session_state.api_key,
+                            question=st.session_state.question_text,
+                            responses=sample_list,
+                            codebook_text=cb_text,
+                            model=review_model
+                        )
+                        st.info(f"Found {len(uncovered_idx)} uncovered responses out of {actual_n}.")
+                        if uncovered_idx:
+                            uncovered = [sample_list[i] for i in uncovered_idx]
+                            st.markdown("Select a response to propose a new code:")
+                            sel_resp = st.selectbox("Uncovered response:", options=uncovered, key="uncovered_select")
+                            if st.button("Propose New Code", use_container_width=True):
+                                with st.spinner("Proposing a new code..."):
+                                    proposed = propose_new_code_for_response(st.session_state.api_key, st.session_state.question_text, sel_resp, review_model)
+                                    if proposed and proposed.code:
+                                        st.session_state.structured_codebook.codes.append(proposed)
+                                        st.success(f"Added proposed code: {proposed.code}")
+                                        st.rerun()
+                                    else:
+                                        st.error("Failed to propose a new code.")
         
         with st.expander("📝 Refine with Instructions (no new examples)"):
             user_refine_instructions = st.text_area("Write instructions to refine the current codebook:", placeholder="e.g., 'Combine \"Delivery Time\" and \"Shipping Speed\". Split \"Price\" into \"High Price\" and \"Unexpected Fees\".'", height=140)
@@ -374,15 +514,15 @@ else:
                         if not refined:
                             st.error("Failed to refine the codebook with the provided instructions.")
                         else:
-                            st.session_state.structured_codebook = refined
+                            st.session_state.structured_codebook = normalize_codebook(refined)
                             st.session_state.selected_code_index = 0
                             st.success("Codebook refined using your instructions.")
                             st.rerun()
 
-        with st.expander("🔄 Refine with New Examples & Merge"):
+        with st.expander("🔄 Refine codebook automatically with new examples"):
             st.markdown("Generate a second codebook from a new random sample and merge it with the current one.")
             refine_sample_size = st.slider("Number of examples to resample:", 10, 600, 150, 10)
-            user_merge_instructions = st.text_area("Additional Instructions for Merging (Optional):", placeholder="e.g., 'Merge \"Price\" and \"Cost\" into a single \"Monetary Concerns\" code.'", height=120)
+            user_merge_instructions = st.text_area("Additional Instructions for Merging (Optional):", placeholder="e.g., 'Be more specific with the codes'", height=120)
             if st.button("🚀 Refine & Merge Codebook"):
                 with st.spinner("Refining and merging codebook..."):
                     initial_codebook = st.session_state.structured_codebook
@@ -407,21 +547,101 @@ else:
                             if not merged_codebook:
                                 st.error("Failed to merge codebooks.")
                             else:
-                                st.session_state.structured_codebook = merged_codebook
+                                st.session_state.structured_codebook = normalize_codebook(merged_codebook)
                                 st.session_state.selected_code_index = 0
                                 st.success("Codebooks merged! The updated codebook is now displayed below.")
                                 st.rerun()
+
+        st.divider()
+        st.header("4. Test Codebook")
+        st.markdown("##### Classify Custom Text")
+        manual_text = st.text_area("Enter a response to classify:", height=120)
+        test_model = st.selectbox("Model for testing:", ["gpt-4.1-mini", "gpt-4.1-nano"], index=0, key="test_model_single")
+        test_multilabel = st.checkbox("Enable Multi-Label for test", value=False, key="test_multilabel_single")
+        if st.button("Classify Text", use_container_width=True):
+            final_codebook_text = reconstruct_codebook_text(st.session_state.structured_codebook)
+            if not manual_text.strip():
+                st.warning("Please enter some text to classify.")
+            elif not final_codebook_text:
+                st.error("Codebook is empty.")
+            else:
+                if test_multilabel:
+                    prompt = classify_response_prompt_multi(st.session_state.question_text, manual_text.strip(), final_codebook_text)
+                    parsed = call_openai_api(st.session_state.api_key, "You are a multi-label survey coding assistant.", prompt, model=test_model, pydantic_model=ClassificationOutput)
+                else:
+                    prompt = classify_response_prompt(st.session_state.question_text, manual_text.strip(), final_codebook_text)
+                    parsed = call_openai_api(st.session_state.api_key, "You are a survey coding assistant.", prompt, model=test_model, pydantic_model=ClassificationOutput)
+                if not parsed or not parsed.items:
+                    st.info("No Code Applied")
+                else:
+                    items_df = pd.DataFrame([{
+                        "label": it.label,
+                        "fragment": it.fragment,
+                        "pertinence": it.pertinence,
+                        "explanation": it.explanation
+                    } for it in parsed.items])
+                    st.dataframe(items_df, use_container_width=True)
+
+        st.markdown("##### Classify Random Sample")
+        sample_n = st.slider("Number of random responses:", 1, 50, 10, 1)
+        test_model_batch = st.selectbox("Model for testing batch:", ["gpt-4.1-mini", "gpt-4.1-nano"], index=0, key="test_model_batch")
+        test_multilabel_batch = st.checkbox("Enable Multi-Label for batch", value=False, key="test_multilabel_batch")
+        if st.button("Classify Random Sample", use_container_width=True):
+            col_to_use = st.session_state.get('column_to_code', None)
+            if not col_to_use or col_to_use not in df.columns:
+                st.error("No valid column selected for coding.")
+            else:
+                series = df[col_to_use].dropna().astype(str)
+                series = series[series.str.strip() != ""]
+                if series.empty:
+                    st.warning("No responses available to classify.")
+                else:
+                    actual_n = min(sample_n, len(series))
+                    sample_list = series.sample(n=actual_n, replace=False).tolist()
+                    final_codebook_text = reconstruct_codebook_text(st.session_state.structured_codebook)
+                    if not final_codebook_text:
+                        st.error("Codebook is empty.")
+                    else:
+                        evidence_rows = []
+                        for resp in sample_list:
+                            if test_multilabel_batch:
+                                prompt = classify_response_prompt_multi(st.session_state.question_text, resp, final_codebook_text)
+                                parsed = call_openai_api(st.session_state.api_key, "You are a multi-label survey coding assistant.", prompt, model=test_model_batch, pydantic_model=ClassificationOutput)
+                            else:
+                                prompt = classify_response_prompt(st.session_state.question_text, resp, final_codebook_text)
+                                parsed = call_openai_api(st.session_state.api_key, "You are a survey coding assistant.", prompt, model=test_model_batch, pydantic_model=ClassificationOutput)
+                            if not parsed or not parsed.items:
+                                evidence_rows.append({
+                                    "Response": resp,
+                                    "label": "No Code Applied",
+                                    "fragment": "",
+                                    "pertinence": None,
+                                    "explanation": ""
+                                })
+                            else:
+                                for it in parsed.items:
+                                    evidence_rows.append({
+                                        "Response": resp,
+                                        "label": it.label,
+                                        "fragment": it.fragment,
+                                        "pertinence": it.pertinence,
+                                        "explanation": it.explanation
+                                    })
+                        test_df = pd.DataFrame(evidence_rows)
+                        st.dataframe(test_df, use_container_width=True)
         
         st.divider()
-        st.header("4. Classify All Responses")
+        st.header("5. Classify All Responses")
         classification_model = st.selectbox("Select Model for Final Classification:", ["gpt-4.1-mini", "gpt-4.1-nano"], index=0)
         
         # --- NEW: Checkboxes for classification mode ---
-        col_mode_1, col_mode_2 = st.columns(2)
+        col_mode_1, col_mode_2, col_mode_3 = st.columns(3)
         with col_mode_1:
             use_multilabel = st.checkbox("✅ Enable Multi-Label Classification", value=False, help="Allow assigning multiple codes to a single response. More comprehensive but can be slower.")
         with col_mode_2:
             use_clustering = st.checkbox("⚡️ Accelerate with Semantic Clustering", value=True, help="Group similar responses to reduce API calls. Highly recommended.")
+        with col_mode_3:
+            include_explanations = st.checkbox("💬 Include Explanations", value=True, help="If disabled, the model will not generate explanations to save tokens.")
 
         if st.button("🚀 Classify All Responses", use_container_width=True):
             final_codebook_text = reconstruct_codebook_text(st.session_state.structured_codebook)
@@ -444,14 +664,22 @@ else:
                 # --- MODIFIED: The core classification loop now handles multi-label ---
                 def classify_item(response):
                     if use_multilabel:
-                        prompt = classify_response_prompt_multi(st.session_state.question_text, response, final_codebook_text)
-                        result = call_openai_api(st.session_state.api_key, "You are a multi-label survey coding assistant.", prompt, model=classification_model, pydantic_model=ClassificationResult)
-                        if result and result.assigned_codes:
-                            return " | ".join(result.assigned_codes) # Join list into a string
-                        return "No Code Applied" if result else "API_ERROR"
+                        prompt = classify_response_prompt_multi(st.session_state.question_text, response, final_codebook_text, include_explanation=include_explanations)
+                        parsed = call_openai_api(st.session_state.api_key, "You are a multi-label survey coding assistant.", prompt, model=classification_model, pydantic_model=ClassificationOutput)
                     else: # Single-label path
-                        prompt = classify_response_prompt(st.session_state.question_text, response, final_codebook_text)
-                        return call_openai_api(st.session_state.api_key, "You are a survey coding assistant.", prompt, model=classification_model) or "API_ERROR"
+                        prompt = classify_response_prompt(st.session_state.question_text, response, final_codebook_text, include_explanation=include_explanations)
+                        parsed = call_openai_api(st.session_state.api_key, "You are a survey coding assistant.", prompt, model=classification_model, pydantic_model=ClassificationOutput)
+                    if not parsed or parsed.items is None:
+                        return {"Assigned Code": "API_ERROR", "Details": []}
+                    labels = [item.label for item in parsed.items] if parsed.items else []
+                    label_str = " | ".join(labels) if labels else "No Code Applied"
+                    details = [{
+                        "label": item.label,
+                        "fragment": item.fragment,
+                        "pertinence": item.pertinence,
+                        "explanation": item.explanation if include_explanations else None
+                    } for item in parsed.items]
+                    return {"Assigned Code": label_str, "Details": details}
 
                 if use_clustering and len(unique_responses) > 1:
                     # (Clustering logic remains the same, but now calls the unified classify_item function)
@@ -479,7 +707,14 @@ else:
                         results_cache[response] = classify_item(response) # Call unified function
                         progress_bar.progress(int(100 * (i + 1) / len(unique_responses)), text=f"Classifying unique response {i+1}/{len(unique_responses)}...")
                 
-                progress_bar.progress(95, text="Step 4/4: Applying classifications..."); final_df = df.copy(); final_df['Assigned Code'] = final_df[column_to_code].map(results_cache); st.session_state.classified_df = final_df
+                progress_bar.progress(95, text="Step 4/4: Applying classifications...")
+                final_df = df.copy()
+                # Map label strings and details separately
+                assigned_map = {k: v.get("Assigned Code", "") for k, v in results_cache.items()}
+                details_map = {k: v.get("Details", []) for k, v in results_cache.items()}
+                final_df['Assigned Code'] = final_df[column_to_code].map(assigned_map)
+                final_df['Assigned Details'] = final_df[column_to_code].map(details_map)
+                st.session_state.classified_df = final_df
                 progress_bar.progress(100, text="Classification complete!"); st.success("Classification complete!")
 
     if st.session_state.classified_df is not None:
@@ -509,6 +744,17 @@ else:
             cols.append('Assigned Code')
         display_df = st.session_state.classified_df[cols] if cols else st.session_state.classified_df
         st.dataframe(display_df)
+
+        # Show details for selected row
+        if 'Assigned Details' in st.session_state.classified_df.columns:
+            with st.expander("View classification details"):
+                idx = st.number_input("Row index to inspect", min_value=0, max_value=len(st.session_state.classified_df)-1, value=0, step=1)
+                details = st.session_state.classified_df.iloc[int(idx)]['Assigned Details']
+                if isinstance(details, list) and details:
+                    details_df = pd.DataFrame(details)
+                    st.dataframe(details_df, use_container_width=True)
+                else:
+                    st.write("No details available for this row.")
         
         # --- MODIFIED: Frequency table now handles multi-label results ---
         st.subheader("Code Frequencies")
@@ -523,6 +769,29 @@ else:
         freq_counts['Percentage'] = (freq_counts['Frequency'] / freq_counts['Frequency'].sum()).map('{:.2%}'.format)
         st.dataframe(freq_counts, use_container_width=True)
 
-        d_col1, d_col2 = st.columns(2)
+        # Prepare one-hot (multi-label) CSV
+        ohe_bytes = None
+        try:
+            if 'Assigned Code' in st.session_state.classified_df.columns:
+                ser = st.session_state.classified_df['Assigned Code'].fillna("")
+                # Parse labels per row using pipe separator
+                lists = ser.apply(lambda s: [c.strip() for c in re.split(r'\s*\|\s*', s) if c.strip()] if isinstance(s, str) and s else [])
+                # Build unique set of labels excluding placeholders
+                all_labels = sorted({c for sub in lists for c in sub if c not in ("No Code Applied", "API_ERROR")})
+                if all_labels:
+                    ohe_df = pd.DataFrame(0, index=st.session_state.classified_df.index, columns=all_labels, dtype=int)
+                    for idx, labels in lists.items():
+                        for c in labels:
+                            if c in ohe_df.columns:
+                                ohe_df.at[idx, c] = 1
+                    # Prepend original column if available
+                    if col_to_show and col_to_show in st.session_state.classified_df.columns:
+                        ohe_df = pd.concat([st.session_state.classified_df[[col_to_show]], ohe_df], axis=1)
+                    ohe_bytes = convert_df_to_downloadable(ohe_df, "CSV")
+        except Exception as e:
+            pass
+
+        d_col1, d_col2, d_col3 = st.columns(3)
         d_col1.download_button("📥 Download as CSV", convert_df_to_downloadable(st.session_state.classified_df, "CSV"), "classified_data.csv", "text/csv", use_container_width=True)
         d_col2.download_button("📥 Download as Excel", convert_df_to_downloadable(st.session_state.classified_df, "Excel"), "classified_data.xlsx", use_container_width=True)
+        d_col3.download_button("📥 Download One-Hot (CSV)", ohe_bytes if ohe_bytes else b"", "classified_one_hot.csv", "text/csv", disabled=(ohe_bytes is None), use_container_width=True)
