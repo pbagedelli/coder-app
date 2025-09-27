@@ -8,6 +8,11 @@ import numpy as np
 from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import normalize
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# --- Constants ---
+BATCH_SIZE = 64
+MAX_CONCURRENCY = 8
 
 # --- Pydantic Models ---
 class Code(BaseModel):
@@ -30,6 +35,13 @@ class ClassificationOutput(BaseModel):
 
 class UncoveredReview(BaseModel):
     uncovered: list[int] = Field(default_factory=list, description="0-based indices of responses with no applicable codes")
+
+class BatchItem(BaseModel):
+    index: int
+    items: list[ClassificationEvidence] = Field(default_factory=list)
+
+class BatchClassificationOutput(BaseModel):
+    results: list[BatchItem] = Field(default_factory=list)
 
 # --- Page Configuration ---
 st.set_page_config(page_title="Intelligent Survey Coder", page_icon="", layout="wide")
@@ -320,6 +332,62 @@ If all responses are covered, return {{ "uncovered": [] }}.
     if res and isinstance(res.uncovered, list):
         return [i for i in res.uncovered if isinstance(i, int) and 0 <= i < len(responses)]
     return []
+
+def _chunk_list(items: list[str], size: int) -> list[list[str]]:
+    return [items[i:i+size] for i in range(0, len(items), size)]
+
+def classify_batch(api_key: str, question: str, responses: list[str], codebook_text: str, model: str, multi: bool, include_explanations: bool) -> list[dict]:
+    if not responses:
+        return []
+    indexed = "\n".join([f"[{i}] \"{resp}\"" for i, resp in enumerate(responses)])
+    system_msg = "You are a survey coding assistant."
+    explanation_field = ', "explanation": string' if include_explanations else ''
+    explanation_note = '' if include_explanations else '\nDo NOT include an "explanation" field.'
+    single_rule = 'For single-label, each items list MUST contain exactly one item.' if not multi else ''
+    prompt = f"""Analyze the indexed responses against the codebook.
+Question: "{question}"
+Codebook:\n---\n{codebook_text}\n---
+Responses (indexed):\n{indexed}
+Return ONLY JSON with this schema:
+{{
+  "results": [
+    {{ "index": number, "items": [ {{ "label": string, "fragment": string, "pertinence": number (0-1){explanation_field} }} ] }}
+  ]
+}}{explanation_note}
+{single_rule}
+For uncovered responses, use an empty list for items.
+"""
+    parsed = call_openai_api(api_key, system_msg, prompt, model=model, pydantic_model=BatchClassificationOutput)
+    # Build default empty aligned list
+    aligned: list[dict] = [{"Assigned Code": "No Code Applied", "Details": []} for _ in responses]
+    if not parsed or not parsed.results:
+        return aligned
+    for item in parsed.results:
+        if not isinstance(item.index, int) or item.index < 0 or item.index >= len(responses):
+            continue
+        labels = [ev.label for ev in (item.items or [])]
+        label_str = " | ".join(labels) if labels else "No Code Applied"
+        details = [{
+            "label": ev.label,
+            "fragment": ev.fragment,
+            "pertinence": ev.pertinence,
+            "explanation": ev.explanation if include_explanations else None
+        } for ev in (item.items or [])]
+        aligned[item.index] = {"Assigned Code": label_str, "Details": details}
+    return aligned
+
+def classify_batches_async(api_key: str, question: str, batched_responses: list[list[str]], codebook_text: str, model: str, multi: bool, include_explanations: bool) -> list[list[dict]]:
+    if not batched_responses:
+        return []
+    results: list[list[dict]] = [None] * len(batched_responses)  # type: ignore
+    def worker(idx: int, batch: list[str]) -> tuple[int, list[dict]]:
+        return idx, classify_batch(api_key, question, batch, codebook_text, model, multi, include_explanations)
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
+        future_to_idx = {executor.submit(worker, i, b): i for i, b in enumerate(batched_responses)}
+        for future in as_completed(future_to_idx):
+            i, res = future.result()
+            results[i] = res
+    return results
 
 # --- UI Layout ---
 st.title("Survey Coder")
@@ -687,25 +755,61 @@ else:
                     if not embeddings: st.error("Failed to generate embeddings."); st.stop()
                     progress_bar.progress(15, text="Step 2/4: Clustering responses..."); embeddings = normalize(np.array(embeddings)); db = DBSCAN(eps=0.3, min_samples=2, metric='cosine').fit(embeddings); labels = db.labels_
                     cluster_ids = set(labels); n_clusters = len(cluster_ids) - (1 if -1 in labels else 0); outliers = [response for response, label in zip(unique_responses, labels) if label == -1]; n_outliers = len(outliers)
-                    total_api_calls = n_clusters + n_outliers
+                    outlier_batches = _chunk_list(outliers, BATCH_SIZE)
+                    total_api_calls = n_clusters + len(outlier_batches)
                     if total_api_calls == 0: st.info("No new responses to classify."); st.stop()
                     st.info(f"Found {n_clusters} groups and {n_outliers} unique outliers. Total classifications needed: {total_api_calls}.")
                     calls_made = 0; response_to_cluster = {response: label for response, label in zip(unique_responses, labels)}; classified_clusters = {}
+                    outlier_status = st.empty()
                     for cluster_id in cluster_ids:
                         if cluster_id != -1:
                             representative = next(response for response, label in response_to_cluster.items() if label == cluster_id)
                             code_str = classify_item(representative) # Call unified function
                             classified_clusters[cluster_id] = code_str; calls_made += 1
                             progress_bar.progress(15 + int(70 * (calls_made / total_api_calls)), text=f"Step 3/4: Classifying group {calls_made}/{total_api_calls}...")
-                    for response in outliers:
-                        results_cache[response] = classify_item(response); calls_made += 1 # Call unified function
-                        progress_bar.progress(15 + int(70 * (calls_made / total_api_calls)), text=f"Step 3/4: Classifying outlier {calls_made}/{total_api_calls}...")
+                    # Minibatch outliers (async)
+                    if outliers:
+                        batched = outlier_batches
+                        outlier_status.info(f"Launching {len(batched)} outlier batches asynchronously (up to {MAX_CONCURRENCY} concurrent)...")
+                        async_results = classify_batches_async(
+                            api_key=st.session_state.api_key,
+                            question=st.session_state.question_text,
+                            batched_responses=batched,
+                            codebook_text=final_codebook_text,
+                            model=classification_model,
+                            multi=use_multilabel,
+                            include_explanations=include_explanations
+                        )
+                        for batch_index, (batch, batch_results) in enumerate(zip(batched, async_results), start=1):
+                            for resp, res in zip(batch, batch_results):
+                                results_cache[resp] = res
+                            calls_made += 1
+                            progress_bar.progress(15 + int(70 * (calls_made / total_api_calls)), text=f"Step 3/4: Completed outlier batch {batch_index}/{len(batched)}")
+                    outlier_status.empty()
                     for response, label in response_to_cluster.items():
                         if label != -1: results_cache[response] = classified_clusters[label]
                 else:
-                    for i, response in enumerate(unique_responses):
-                        results_cache[response] = classify_item(response) # Call unified function
-                        progress_bar.progress(int(100 * (i + 1) / len(unique_responses)), text=f"Classifying unique response {i+1}/{len(unique_responses)}...")
+                    # Minibatch the full set
+                    batches = _chunk_list(unique_responses, BATCH_SIZE)
+                    total_batches = len(batches)
+                    processed = 0
+                    batch_status = st.empty()
+                    batch_status.info(f"Launching {total_batches} batches asynchronously (up to {MAX_CONCURRENCY} concurrent)...")
+                    async_results = classify_batches_async(
+                        api_key=st.session_state.api_key,
+                        question=st.session_state.question_text,
+                        batched_responses=batches,
+                        codebook_text=final_codebook_text,
+                        model=classification_model,
+                        multi=use_multilabel,
+                        include_explanations=include_explanations
+                    )
+                    for batch_index, (batch, batch_results) in enumerate(zip(batches, async_results), start=1):
+                        for resp, res in zip(batch, batch_results):
+                            results_cache[resp] = res
+                        processed += len(batch)
+                        progress_bar.progress(int(100 * processed / len(unique_responses)), text=f"Classifying unique responses {processed}/{len(unique_responses)} (batch {batch_index}/{total_batches})...")
+                    batch_status.empty()
                 
                 progress_bar.progress(95, text="Step 4/4: Applying classifications...")
                 final_df = df.copy()
@@ -743,6 +847,28 @@ else:
         if 'Assigned Code' in st.session_state.classified_df.columns:
             cols.append('Assigned Code')
         display_df = st.session_state.classified_df[cols] if cols else st.session_state.classified_df
+        # Optional filter to view only one label in the table
+        try:
+            assigned_series = st.session_state.classified_df['Assigned Code'].fillna("")
+            all_labels_view = sorted({
+                c.strip()
+                for row in assigned_series
+                for c in re.split(r'\s*\|\s*', str(row))
+                if c.strip() and c not in ("No Code Applied", "API_ERROR")
+            })
+        except Exception:
+            all_labels_view = []
+        selected_label_filter = st.selectbox(
+            "Filter table by label",
+            options=["All labels"] + all_labels_view,
+            index=0,
+            key="results_label_filter"
+        )
+        if selected_label_filter != "All labels" and 'Assigned Code' in display_df.columns:
+            mask = st.session_state.classified_df['Assigned Code'].fillna("").apply(
+                lambda s: selected_label_filter in [c.strip() for c in re.split(r'\s*\|\s*', str(s)) if c.strip()]
+            )
+            display_df = display_df[mask]
         st.dataframe(display_df)
 
         # Show details for selected row
@@ -795,3 +921,82 @@ else:
         d_col1.download_button("📥 Download as CSV", convert_df_to_downloadable(st.session_state.classified_df, "CSV"), "classified_data.csv", "text/csv", use_container_width=True)
         d_col2.download_button("📥 Download as Excel", convert_df_to_downloadable(st.session_state.classified_df, "Excel"), "classified_data.xlsx", use_container_width=True)
         d_col3.download_button("📥 Download One-Hot (CSV)", ohe_bytes if ohe_bytes else b"", "classified_one_hot.csv", "text/csv", disabled=(ohe_bytes is None), use_container_width=True)
+
+        with st.expander("♻️ Reclassify by Included Labels"):
+            if not st.session_state.structured_codebook or not st.session_state.structured_codebook.codes:
+                st.warning("No codebook available.")
+            else:
+                all_labels = [c.code for c in st.session_state.structured_codebook.codes]
+                included = st.multiselect(
+                    "Include only these labels for reclassification (rows without any of these labels are kept as-is):",
+                    options=all_labels,
+                    key="reclass_included_rows"
+                )
+                re_model = st.selectbox("Model:", ["gpt-4.1-mini", "gpt-4.1-nano"], index=0, key="reclass_rows_model")
+                re_multilabel = st.checkbox("Enable Multi-Label", value=True, key="reclass_rows_multilabel")
+                re_explanations = st.checkbox("Include Explanations", value=True, key="reclass_rows_explanations")
+                include_no_code_rows = st.checkbox("Include rows currently labeled 'No Code Applied'", value=True, key="reclass_include_no_code")
+                if st.button("Reclassify Selected Rows", use_container_width=True):
+                    if col_to_show is None or col_to_show not in st.session_state.classified_df.columns:
+                        st.error("No valid text column available.")
+                    else:
+                        df_view = st.session_state.classified_df
+                        indices_to_reclassify = []
+                        texts_to_reclassify = []
+                        included_set = set(included)
+                        for idx, row in df_view.iterrows():
+                            assigned = str(row.get('Assigned Code', '') or '')
+                            labels = [c.strip() for c in re.split(r'\s*\|\s*', assigned) if c.strip() and c not in ("No Code Applied", "API_ERROR")]
+                            if len(labels) == 0:
+                                if not include_no_code_rows:
+                                    continue
+                                indices_to_reclassify.append(idx)
+                                texts_to_reclassify.append(str(row[col_to_show]))
+                            else:
+                                # Include semantics: reclassify if the row has ANY label in the included set
+                                if len(included_set) == 0:
+                                    # Nothing selected: by default, do not reclassify labeled rows
+                                    continue
+                                if re_multilabel:
+                                    if any(l in included_set for l in labels):
+                                        indices_to_reclassify.append(idx)
+                                        texts_to_reclassify.append(str(row[col_to_show]))
+                                else:
+                                    # Single-label: the one label must be included
+                                    if labels[0] in included_set:
+                                        indices_to_reclassify.append(idx)
+                                        texts_to_reclassify.append(str(row[col_to_show]))
+                        if not indices_to_reclassify:
+                            st.info("No rows require reclassification based on the selected exclusions.")
+                        else:
+                            cb_text = reconstruct_codebook_text(st.session_state.structured_codebook)
+                            batches = _chunk_list(texts_to_reclassify, BATCH_SIZE)
+                            total_batches = len(batches)
+                            progress_bar = st.progress(0, text="Reclassifying in batches...")
+                            batch_status = st.empty()
+                            batch_status.info(f"Launching {total_batches} batches asynchronously (up to {MAX_CONCURRENCY} concurrent)...")
+                            async_results = classify_batches_async(
+                                api_key=st.session_state.api_key,
+                                question=st.session_state.question_text,
+                                batched_responses=batches,
+                                codebook_text=cb_text,
+                                model=re_model,
+                                multi=re_multilabel,
+                                include_explanations=re_explanations
+                            )
+                            # Flatten results and apply to the selected indices
+                            flat_results = [res for batch_res in async_results for res in batch_res]
+                            for i, (row_idx, res) in enumerate(zip(indices_to_reclassify, flat_results), start=1):
+                                df_view.at[row_idx, 'Assigned Code'] = res.get('Assigned Code', '')
+                                df_view.at[row_idx, 'Assigned Details'] = res.get('Details', [])
+                                if total_batches > 0:
+                                    progress_bar.progress(int(100 * i / len(indices_to_reclassify)), text=f"Reclassifying rows {i}/{len(indices_to_reclassify)} (batch progress)")
+                            st.session_state.classified_df = df_view
+                            progress_bar.progress(100, text="Reclassification complete!")
+                            st.success("Reclassification complete! Rows with only excluded labels were kept as-is; others were reclassified with the current codebook.")
+                            try:
+                                cols_to_show = [col_to_show, 'Assigned Code'] if col_to_show in df_view.columns else ['Assigned Code']
+                                st.markdown("#### Reclassified Rows")
+                                st.dataframe(df_view.loc[indices_to_reclassify, cols_to_show], use_container_width=True)
+                            except Exception:
+                                pass
