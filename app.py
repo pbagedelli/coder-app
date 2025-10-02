@@ -44,7 +44,7 @@ class BatchClassificationOutput(BaseModel):
     results: list[BatchItem] = Field(default_factory=list)
 
 # --- Page Configuration ---
-st.set_page_config(page_title="Intelligent Survey Coder", page_icon="", layout="wide")
+st.set_page_config(page_title="Intelligent Survey Coder", page_icon="✨​", layout="wide")
 
 # --- State Management ---
 def initialize_state():
