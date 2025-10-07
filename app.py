@@ -9,6 +9,10 @@ from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import normalize
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+try:
+    import tiktoken  # type: ignore
+except Exception:
+    tiktoken = None  # Fallback to heuristic if unavailable
 
 # --- Constants ---
 BATCH_SIZE = 64
@@ -72,6 +76,37 @@ def convert_df_to_downloadable(df, format="CSV"):
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer: df.to_excel(writer, index=False, sheet_name='Sheet1')
         return output.getvalue()
 
+# --- Token Estimation Helpers ---
+def _get_token_encoder(model: str):
+    if tiktoken is None:
+        return None
+    try:
+        # Try exact model mapping first
+        return tiktoken.encoding_for_model(model)
+    except Exception:
+        try:
+            # Heuristics for newer GPT-4.x / 4o families
+            if any(k in model for k in ["gpt-4o", "gpt-4.1"]):
+                return tiktoken.get_encoding("o200k_base")
+            # Default for GPT-3.5/4 families
+            return tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            return None
+
+def estimate_token_count(text: str, model: str) -> int:
+    encoder = _get_token_encoder(model)
+    if encoder is not None:
+        try:
+            return len(encoder.encode(text))
+        except Exception:
+            pass
+    # Rough fallback: ~4 chars per token
+    return max(1, int(len(text) / 4))
+
+def estimate_chat_tokens(system_text: str, user_text: str, model: str) -> int:
+    # Minimal overhead per message; we keep it simple and robust
+    return estimate_token_count(system_text, model) + estimate_token_count(user_text, model) + 6
+
 def reconstruct_codebook_text(codebook_obj: Codebook):
     if not codebook_obj or not codebook_obj.codes: return ""
     return "\n".join([f"- Code: {item.code}\n  Description: {item.description}" for item in codebook_obj.codes]).strip()
@@ -128,8 +163,36 @@ def classify_response_prompt_multi(question, response, codebook_text, include_ex
 
 def get_embeddings(texts: list[str], api_key: str, model="text-embedding-3-small"):
     client = OpenAI(api_key=api_key)
-    response = client.embeddings.create(input=texts, model=model)
-    return [embedding.embedding for embedding in response.data]
+    
+    # Batch texts to ensure no batch exceeds 8k tokens
+    MAX_TOKENS_PER_BATCH = 8000
+    batches = []
+    current_batch = []
+    current_tokens = 0
+    
+    for text in texts:
+        text_tokens = estimate_token_count(text, model)
+        
+        # If adding this text would exceed limit, start a new batch
+        if current_tokens + text_tokens > MAX_TOKENS_PER_BATCH and current_batch:
+            batches.append(current_batch)
+            current_batch = [text]
+            current_tokens = text_tokens
+        else:
+            current_batch.append(text)
+            current_tokens += text_tokens
+    
+    # Add the last batch if it has content
+    if current_batch:
+        batches.append(current_batch)
+    
+    # Process each batch and collect all embeddings
+    all_embeddings = []
+    for batch in batches:
+        response = client.embeddings.create(input=batch, model=model)
+        all_embeddings.extend([embedding.embedding for embedding in response.data])
+    
+    return all_embeddings
 
 def call_openai_api(api_key, system_prompt, user_prompt, model="gpt-4o", pydantic_model=None):
     try:
@@ -426,7 +489,7 @@ else:
         st.session_state.column_to_code = column_to_code
         st.session_state.question_text = st.text_area("Edit the question text:", value=column_to_code, height=100)
     with col_config_2:
-        generation_model = st.selectbox("Select Model for Codebook Generation:", ["gpt-4o", "gpt-4.1", "gpt-5"], help="A powerful model is recommended for generation and merging.")
+        generation_model = st.selectbox("Select Model for Codebook Generation:", ["gpt-4.1", "gpt-4o",  "gpt-5"], help="A powerful model is recommended for generation and merging.")
         num_examples = st.slider("Examples for initial codebook:", 10, 600, 150, 10)
 
     st.divider()
@@ -711,6 +774,69 @@ else:
         with col_mode_3:
             include_explanations = st.checkbox("💬 Include Explanations", value=True, help="If disabled, the model will not generate explanations to save tokens.")
 
+        # Pre-calculate an estimated token usage for a single classification call
+        try:
+            preview_example = "example response"
+            final_codebook_text_preview = reconstruct_codebook_text(st.session_state.structured_codebook)
+            if use_multilabel:
+                prompt_preview = classify_response_prompt_multi(st.session_state.question_text, preview_example, final_codebook_text_preview, include_explanation=include_explanations)
+                system_preview = "You are a multi-label survey coding assistant."
+            else:
+                prompt_preview = classify_response_prompt(st.session_state.question_text, preview_example, final_codebook_text_preview, include_explanation=include_explanations)
+                system_preview = "You are a survey coding assistant."
+            est_tokens_per_call = estimate_chat_tokens(system_preview, prompt_preview, classification_model)
+        except Exception:
+            est_tokens_per_call = None
+
+        st.caption(f"Estimated tokens per classification call: {est_tokens_per_call if est_tokens_per_call is not None else 'N/A'}")
+
+        # Estimated embedding tokens (pre-clustering)
+        try:
+            base_unique_responses = df[column_to_code].dropna().unique().tolist()
+            string_responses = [str(item) for item in base_unique_responses]
+            unique_responses = [text for text in string_responses if text.strip()]
+            if use_clustering:
+                embedding_model = "text-embedding-3-small"
+                total_embed_tokens = sum(estimate_token_count(resp, embedding_model) for resp in unique_responses)
+            else:
+                total_embed_tokens = 0
+            st.caption(f"Estimated embedding tokens (pre-clustering): {total_embed_tokens}")
+        except Exception:
+            pass
+
+        # Estimated total classification tokens across mini-batches (upper bound if clustering is enabled)
+        try:
+            final_codebook_text_preview = reconstruct_codebook_text(st.session_state.structured_codebook)
+            # Build batched prompts as classify_batch does
+            batches_for_est = _chunk_list(unique_responses, BATCH_SIZE)
+            total_class_tokens = 0
+            for batch in batches_for_est:
+                indexed = "\n".join([f"[{i}] \"{resp}\"" for i, resp in enumerate(batch)])
+                explanation_field = ', "explanation": string' if include_explanations else ''
+                explanation_note = '' if include_explanations else '\nDo NOT include an "explanation" field.'
+                single_rule = 'For single-label, each items list MUST contain exactly one item.' if not use_multilabel else ''
+                user_text = f"""Analyze the indexed responses against the codebook.
+Question: "{st.session_state.question_text}"
+Codebook:\n---\n{final_codebook_text_preview}\n---
+Responses (indexed):\n{indexed}
+Return ONLY JSON with this schema:
+{{
+  "results": [
+    {{ "index": number, "items": [ {{ "label": string, "fragment": string, "pertinence": number (0-1){explanation_field} }} ] }}
+  ]
+}}{explanation_note}
+{single_rule}
+For uncovered responses, use an empty list for items.
+"""
+                system_text = "You are a survey coding assistant."
+                total_class_tokens += estimate_chat_tokens(system_text, user_text, classification_model)
+            if use_clustering:
+                st.caption(f"Estimated total classification tokens (no-clustering upper bound): {total_class_tokens}")
+            else:
+                st.caption(f"Estimated total classification tokens: {total_class_tokens}")
+        except Exception:
+            pass
+
         if st.button("🚀 Classify All Responses", use_container_width=True):
             final_codebook_text = reconstruct_codebook_text(st.session_state.structured_codebook)
             if not final_codebook_text: st.error("Codebook is empty.")
@@ -728,6 +854,19 @@ else:
 
                 results_cache = {}
                 progress_bar = st.progress(0, text="Initializing classification...")
+                # Show an overall rough estimate of total prompt tokens before starting
+                try:
+                    if use_clustering and len(unique_responses) > 1:
+                        # Upper bound: cluster reps + outlier batch count; conservative estimate
+                        # We cannot know ahead of time; display per-call estimate only
+                        st.info(f"Per-call token estimate: ~{est_tokens_per_call if est_tokens_per_call is not None else 'N/A'} tokens")
+                    else:
+                        batches = _chunk_list(unique_responses, BATCH_SIZE)
+                        total_calls = len(batches)
+                        total_est = est_tokens_per_call * total_calls if est_tokens_per_call is not None else None
+                        st.info(f"Estimated total prompt tokens: {total_est if total_est is not None else 'N/A'} (across {total_calls} calls)")
+                except Exception:
+                    pass
                 
                 # --- MODIFIED: The core classification loop now handles multi-label ---
                 def classify_item(response):
@@ -825,15 +964,17 @@ else:
         st.divider()
         st.header("5. View and Download Results")
         # Normalize separator to pipe for multi-label results (backward compatibility with older runs)
-        if 'Assigned Code' in st.session_state.classified_df.columns:
-            try:
-                series = st.session_state.classified_df['Assigned Code']
-                if pd.api.types.is_object_dtype(series):
-                    needs_conversion = series.fillna("").str.contains(",").any()
-                    if needs_conversion:
-                        st.session_state.classified_df['Assigned Code'] = series.fillna("").str.replace(r'\s*,\s*', ' | ', regex=True)
-            except Exception:
-                pass
+        # Note: This conversion is disabled to preserve commas within single code labels
+        # If you have old data with comma-separated labels, manually convert them to pipe-separated format
+        # if 'Assigned Code' in st.session_state.classified_df.columns:
+        #     try:
+        #         series = st.session_state.classified_df['Assigned Code']
+        #         if pd.api.types.is_object_dtype(series):
+        #             needs_conversion = series.fillna("").str.contains(",").any()
+        #             if needs_conversion:
+        #                 st.session_state.classified_df['Assigned Code'] = series.fillna("").str.replace(r'\s*,\s*', ' | ', regex=True)
+        #     except Exception:
+        #         pass
         # Only show the original coded column and the assigned code
         col_to_show = st.session_state.get('column_to_code', None)
         if not col_to_show:
@@ -917,10 +1058,29 @@ else:
         except Exception as e:
             pass
 
-        d_col1, d_col2, d_col3 = st.columns(3)
+        # Prepare simplified CSV with just original text and code
+        simple_csv_bytes = None
+        try:
+            if 'Assigned Code' in st.session_state.classified_df.columns:
+                col_to_show = st.session_state.get('column_to_code', None)
+                if not col_to_show:
+                    try:
+                        col_to_show = column_to_code
+                    except Exception:
+                        col_to_show = None
+                
+                if col_to_show and col_to_show in st.session_state.classified_df.columns:
+                    simple_df = st.session_state.classified_df[[col_to_show, 'Assigned Code']].copy()
+                    simple_df.columns = ['Original Text', 'Assigned Code']
+                    simple_csv_bytes = convert_df_to_downloadable(simple_df, "CSV")
+        except Exception as e:
+            pass
+
+        d_col1, d_col2, d_col3, d_col4 = st.columns(4)
         d_col1.download_button("📥 Download as CSV", convert_df_to_downloadable(st.session_state.classified_df, "CSV"), "classified_data.csv", "text/csv", use_container_width=True)
         d_col2.download_button("📥 Download as Excel", convert_df_to_downloadable(st.session_state.classified_df, "Excel"), "classified_data.xlsx", use_container_width=True)
         d_col3.download_button("📥 Download One-Hot (CSV)", ohe_bytes if ohe_bytes else b"", "classified_one_hot.csv", "text/csv", disabled=(ohe_bytes is None), use_container_width=True)
+        d_col4.download_button("📥 Download Simple (CSV)", simple_csv_bytes if simple_csv_bytes else b"", "simple_classified.csv", "text/csv", disabled=(simple_csv_bytes is None), use_container_width=True)
 
         with st.expander("♻️ Reclassify by Included Labels"):
             if not st.session_state.structured_codebook or not st.session_state.structured_codebook.codes:

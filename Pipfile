@@ -12,6 +12,7 @@ xlsxwriter = "*"
 pydantic = "*"
 instructor = "*"
 scikit-learn = "*"
+tiktoken = "*"
 
 [dev-packages]
 
