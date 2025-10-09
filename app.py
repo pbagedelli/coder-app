@@ -107,6 +107,32 @@ def estimate_chat_tokens(system_text: str, user_text: str, model: str) -> int:
     # Minimal overhead per message; we keep it simple and robust
     return estimate_token_count(system_text, model) + estimate_token_count(user_text, model) + 6
 
+def estimate_chat_tokens_precise(system_text: str, user_text: str, model: str, overhead_per_message: int = 24) -> int:
+    # Force o200k_base for 4.1 / 4o to better match server-side tokenization
+    enc = None
+    try:
+        if "gpt-4.1" in model or "gpt-4o" in model:
+            enc = tiktoken.get_encoding("o200k_base") if tiktoken else None
+        else:
+            enc = _get_token_encoder(model)
+    except Exception:
+        enc = _get_token_encoder(model)
+
+    try:
+        sys_tokens = len(enc.encode(system_text)) if enc else estimate_token_count(system_text, model)
+        usr_tokens = len(enc.encode(user_text)) if enc else estimate_token_count(user_text, model)
+        # 2 messages (system + user) → add overhead per message
+        return sys_tokens + usr_tokens + 2 * overhead_per_message
+    except Exception:
+        return estimate_token_count(system_text, model) + estimate_token_count(user_text, model) + 2 * overhead_per_message
+
+# --- Dedupe Normalization Helper (lowercase, collapse spaces, strip trailing punctuation) ---
+def _normalize_for_dedupe(text: str) -> str:
+    s = str(text).lower().strip()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[\.]+$", "", s)
+    return s
+
 # --- Label Validation Functions ---
 def get_valid_codebook_labels(codebook_obj: Codebook) -> set[str]:
     """Extract all valid code labels from the codebook."""
@@ -458,7 +484,7 @@ If all responses are covered, return {{ "uncovered": [] }}.
 def _chunk_list(items: list[str], size: int) -> list[list[str]]:
     return [items[i:i+size] for i in range(0, len(items), size)]
 
-def classify_batch(api_key: str, question: str, responses: list[str], codebook_text: str, model: str, multi: bool, include_explanations: bool, codebook_obj: Codebook | None = None) -> list[dict]:
+def classify_batch(api_key: str, question: str, responses: list[str], codebook_text: str, model: str, multi: bool, include_explanations: bool, codebook_obj: Codebook | None = None, usage_accumulator: list | None = None) -> list[dict]:
     if not responses:
         return []
     indexed = "\n".join([f"[{i}] \"{resp}\"" for i, resp in enumerate(responses)])
@@ -480,7 +506,25 @@ Return ONLY JSON with this schema:
 {single_rule}
 For uncovered responses, use an empty list for items.
 """
-    parsed = call_openai_api(api_key, system_msg, prompt, model=model, pydantic_model=BatchClassificationOutput)
+    # Call API with structured parse and capture usage
+    try:
+        client = OpenAI(api_key=api_key)
+        completion = client.chat.completions.parse(
+            model=model,
+            messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}],
+            response_format=BatchClassificationOutput
+        )
+        parsed = completion.choices[0].message.parsed
+        usage = getattr(completion, 'usage', None)
+        if usage_accumulator is not None and usage is not None:
+            try:
+                prompt_tokens = getattr(usage, 'prompt_tokens', None) or getattr(usage, 'input_tokens', None) or 0
+                completion_tokens = getattr(usage, 'completion_tokens', None) or getattr(usage, 'output_tokens', None) or 0
+                usage_accumulator.append((int(prompt_tokens), int(completion_tokens)))
+            except Exception:
+                pass
+    except Exception:
+        parsed = None
     # Build default empty aligned list
     aligned: list[dict] = [{"Assigned Code": "No Code Applied", "Details": []} for _ in responses]
     if not parsed or not parsed.results:
@@ -508,12 +552,12 @@ For uncovered responses, use an empty list for items.
         aligned[item.index] = {"Assigned Code": label_str, "Details": validated_details}
     return aligned
 
-def classify_batches_async(api_key: str, question: str, batched_responses: list[list[str]], codebook_text: str, model: str, multi: bool, include_explanations: bool, codebook_obj: Codebook | None = None) -> list[list[dict]]:
+def classify_batches_async(api_key: str, question: str, batched_responses: list[list[str]], codebook_text: str, model: str, multi: bool, include_explanations: bool, codebook_obj: Codebook | None = None, usage_accumulator: list | None = None) -> list[list[dict]]:
     if not batched_responses:
         return []
     results: list[list[dict]] = [None] * len(batched_responses)  # type: ignore
     def worker(idx: int, batch: list[str]) -> tuple[int, list[dict]]:
-        return idx, classify_batch(api_key, question, batch, codebook_text, model, multi, include_explanations, codebook_obj)
+        return idx, classify_batch(api_key, question, batch, codebook_text, model, multi, include_explanations, codebook_obj, usage_accumulator)
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
         future_to_idx = {executor.submit(worker, i, b): i for i, b in enumerate(batched_responses)}
         for future in as_completed(future_to_idx):
@@ -839,44 +883,48 @@ else:
         with col_mode_1:
             use_multilabel = st.checkbox("✅ Enable Multi-Label Classification", value=False, help="Allow assigning multiple codes to a single response. More comprehensive but can be slower.")
         with col_mode_2:
-            include_explanations = st.checkbox("💬 Include Explanations", value=True, help="If disabled, the model will not generate explanations to save tokens.")
+            include_explanations = st.checkbox("💬 Include Explanations", value=False, help="If disabled, the model will not generate explanations to save tokens.")
 
-        # Pre-calculate an estimated token usage for a single classification call
-        try:
-            preview_example = "example response"
-            final_codebook_text_preview = reconstruct_codebook_text(st.session_state.structured_codebook)
-            if use_multilabel:
-                prompt_preview = classify_response_prompt_multi(st.session_state.question_text, preview_example, final_codebook_text_preview, include_explanation=include_explanations)
-                system_preview = "You are a multi-label survey coding assistant."
-            else:
-                prompt_preview = classify_response_prompt(st.session_state.question_text, preview_example, final_codebook_text_preview, include_explanation=include_explanations)
-                system_preview = "You are a survey coding assistant."
-            est_tokens_per_call = estimate_chat_tokens(system_preview, prompt_preview, classification_model)
-        except Exception:
-            est_tokens_per_call = None
-
-        st.caption(f"Estimated tokens per classification call: {est_tokens_per_call if est_tokens_per_call is not None else 'N/A'}")
 
         # Clustering removed: no embedding estimate needed
 
-        # Estimated total classification tokens across mini-batches
+        # Estimated prompt and completion tokens across mini-batches (based on exact messages)
         try:
             final_codebook_text_preview = reconstruct_codebook_text(st.session_state.structured_codebook)
-            base_unique_responses = df[column_to_code].dropna().unique().tolist()
-            string_responses = [str(item) for item in base_unique_responses]
-            unique_responses_for_est = [text for text in string_responses if text.strip()]
-            # Build batched prompts as classify_batch does
-            batches_for_est = _chunk_list(unique_responses_for_est, BATCH_SIZE)
-            total_class_tokens = 0
+
+            # Build deduped normalized set like we do in the run
+            base_values = df[column_to_code].dropna().tolist()
+            string_values = [str(v) for v in base_values]
+            string_values = [t for t in string_values if t.strip()]
+            unique_norm_keys = list({ _normalize_for_dedupe(t) for t in string_values if _normalize_for_dedupe(t) })
+
+            batches_for_est = _chunk_list(unique_norm_keys, BATCH_SIZE)
+
+            prompt_tokens_est = 0
+            completion_tokens_est = 0
+
+            # Heuristics for completion:
+            # - items/response: 1 for single-label; 2 for multi-label
+            # - tokens/item: 40 without explanation; 120 with explanation
+            avg_items_per_response = 2 if use_multilabel else 1
+            tokens_per_item = 120 if include_explanations else 40
+
             for batch in batches_for_est:
                 indexed = "\n".join([f"[{i}] \"{resp}\"" for i, resp in enumerate(batch)])
                 explanation_field = ', "explanation": string' if include_explanations else ''
                 explanation_note = '' if include_explanations else '\nDo NOT include an "explanation" field.'
                 single_rule = 'For single-label, each items list MUST contain exactly one item.' if not use_multilabel else ''
+
                 user_text = f"""Analyze the indexed responses against the codebook.
 Question: "{st.session_state.question_text}"
-Codebook:\n---\n{final_codebook_text_preview}\n---
-Responses (indexed):\n{indexed}
+Codebook:
+---
+{final_codebook_text_preview}
+---
+Responses (indexed):
+{indexed}
+IMPORTANT: The "label" field MUST be exactly one of the code names from the codebook above. Do not create new labels or modify existing ones.
+
 Return ONLY JSON with this schema:
 {{
   "results": [
@@ -886,9 +934,16 @@ Return ONLY JSON with this schema:
 {single_rule}
 For uncovered responses, use an empty list for items.
 """
+
                 system_text = "You are a survey coding assistant."
-                total_class_tokens += estimate_chat_tokens(system_text, user_text, classification_model)
-            st.caption(f"Estimated total classification tokens: {total_class_tokens}")
+                prompt_tokens_est += estimate_chat_tokens_precise(system_text, user_text, classification_model, overhead_per_message=24)
+
+                # Completion heuristic for this batch
+                completion_tokens_est += len(batch) * avg_items_per_response * tokens_per_item
+
+            st.caption(f"Estimated prompt tokens (all batches): {prompt_tokens_est}")
+            st.caption(f"Estimated completion tokens (all batches): {completion_tokens_est}")
+            st.caption(f"Estimated total tokens: {prompt_tokens_est + completion_tokens_est}")
         except Exception:
             pass
 
@@ -898,25 +953,23 @@ For uncovered responses, use an empty list for items.
             else:
                 #unique_responses = df[column_to_code].dropna().unique().tolist()
 
-                # 1. Get potentially mixed-type unique values
-                base_unique_responses = df[column_to_code].dropna().unique().tolist()
-                                
-                # 2. Convert every item to a string first
-                string_responses = [str(item) for item in base_unique_responses]
-                                
-                # 3. Now, safely filter out empty/whitespace strings
-                unique_responses = [text for text in string_responses if text.strip()]
+                # 1. Collect responses (mixed types possible)
+                base_values = df[column_to_code].dropna().tolist()
+                # 2. Convert to str and filter non-empty
+                string_values = [str(v) for v in base_values]
+                string_values = [t for t in string_values if t.strip()]
+                # 3. Build normalization map to dedupe exact normalized duplicates
+                norm_to_originals: dict[str, list[str]] = {}
+                for t in string_values:
+                    k = _normalize_for_dedupe(t)
+                    if not k:
+                        continue
+                    norm_to_originals.setdefault(k, []).append(t)
+                # Representatives to classify
+                unique_responses = list(norm_to_originals.keys())
 
                 results_cache = {}
                 progress_bar = st.progress(0, text="Initializing classification...")
-                # Show an overall rough estimate of total prompt tokens before starting
-                try:
-                    batches = _chunk_list(unique_responses, BATCH_SIZE)
-                    total_calls = len(batches)
-                    total_est = est_tokens_per_call * total_calls if est_tokens_per_call is not None else None
-                    st.info(f"Estimated total prompt tokens: {total_est if total_est is not None else 'N/A'} (across {total_calls} calls)")
-                except Exception:
-                    pass
                 
                 # --- MODIFIED: The core classification loop now handles multi-label ---
                 def classify_item(response):
@@ -950,6 +1003,7 @@ For uncovered responses, use an empty list for items.
                 processed = 0
                 batch_status = st.empty()
                 batch_status.info(f"Launching {total_batches} batches asynchronously (up to {MAX_CONCURRENCY} concurrent)...")
+                usage_records: list[tuple[int, int]] = []
                 async_results = classify_batches_async(
                     api_key=st.session_state.api_key,
                     question=st.session_state.question_text,
@@ -958,7 +1012,8 @@ For uncovered responses, use an empty list for items.
                     model=classification_model,
                     multi=use_multilabel,
                     include_explanations=include_explanations,
-                    codebook_obj=st.session_state.structured_codebook
+                    codebook_obj=st.session_state.structured_codebook,
+                    usage_accumulator=usage_records
                 )
                 for batch_index, (batch, batch_results) in enumerate(zip(batches, async_results), start=1):
                     for resp, res in zip(batch, batch_results):
@@ -966,14 +1021,31 @@ For uncovered responses, use an empty list for items.
                     processed += len(batch)
                     progress_bar.progress(int(100 * processed / len(unique_responses)), text=f"Classifying unique responses {processed}/{len(unique_responses)} (batch {batch_index}/{total_batches})...")
                 batch_status.empty()
+                # Summarize usage
+                try:
+                    total_prompt = sum(p for p, c in usage_records)
+                    total_completion = sum(c for p, c in usage_records)
+                    st.info(f"Token usage (this run): prompt={total_prompt}, completion={total_completion}, total={total_prompt + total_completion}")
+                except Exception:
+                    pass
                 
                 progress_bar.progress(95, text="Step 4/4: Applying classifications...")
                 final_df = df.copy()
                 # Map label strings and details separately
-                assigned_map = {k: v.get("Assigned Code", "") for k, v in results_cache.items()}
-                details_map = {k: v.get("Details", []) for k, v in results_cache.items()}
-                final_df['Assigned Code'] = final_df[column_to_code].map(assigned_map)
-                final_df['Assigned Details'] = final_df[column_to_code].map(details_map)
+                # Expand deduped results back to original texts by normalization key
+                assigned_map_raw = {k: v.get("Assigned Code", "") for k, v in results_cache.items()}
+                details_map_raw = {k: v.get("Details", []) for k, v in results_cache.items()}
+                # Build per-original maps
+                per_original_assigned: dict[str, str] = {}
+                per_original_details: dict[str, list] = {}
+                for norm_key, originals in norm_to_originals.items():
+                    code_val = assigned_map_raw.get(norm_key, "")
+                    det_val = details_map_raw.get(norm_key, [])
+                    for original in originals:
+                        per_original_assigned[original] = code_val
+                        per_original_details[original] = det_val
+                final_df['Assigned Code'] = final_df[column_to_code].map(per_original_assigned)
+                final_df['Assigned Details'] = final_df[column_to_code].map(per_original_details)
                 st.session_state.classified_df = final_df
                 progress_bar.progress(100, text="Classification complete!"); st.success("Classification complete!")
 
@@ -1190,7 +1262,7 @@ For uncovered responses, use an empty list for items.
                 # Controls for this reclassification
                 no_model = st.selectbox("Model:", ["gpt-4.1-mini", "gpt-4.1-nano", "gpt-4.1"], index=0, key="reclass_nocode_model")
                 no_multilabel = st.checkbox("Enable Multi-Label", value=True, key="reclass_nocode_multilabel")
-                no_explanations = st.checkbox("Include Explanations", value=True, key="reclass_nocode_explanations")
+                no_explanations = st.checkbox("Include Explanations", value=False, key="reclass_nocode_explanations")
                 if st.button("Reclassify 'No Code Applied' Rows", use_container_width=True):
                     # Determine text column to use
                     col_to_show_local = st.session_state.get('column_to_code', None)
@@ -1219,6 +1291,7 @@ For uncovered responses, use an empty list for items.
                             progress_bar = st.progress(0, text="Reclassifying 'No Code Applied' rows in batches...")
                             batch_status = st.empty()
                             batch_status.info(f"Launching {total_batches} batches asynchronously (up to {MAX_CONCURRENCY} concurrent)...")
+                            usage_records_no: list[tuple[int, int]] = []
                             async_results = classify_batches_async(
                                 api_key=st.session_state.api_key,
                                 question=st.session_state.question_text,
@@ -1227,7 +1300,8 @@ For uncovered responses, use an empty list for items.
                                 model=no_model,
                                 multi=no_multilabel,
                                 include_explanations=no_explanations,
-                                codebook_obj=st.session_state.structured_codebook
+                                codebook_obj=st.session_state.structured_codebook,
+                                usage_accumulator=usage_records_no
                             )
                             # Flatten results and apply to the selected indices
                             flat_results = [res for batch_res in async_results for res in batch_res]
@@ -1239,3 +1313,9 @@ For uncovered responses, use an empty list for items.
                             st.session_state.classified_df = df_view
                             progress_bar.progress(100, text="Reclassification complete!")
                             st.success("Reclassification complete! Updated only rows previously labeled 'No Code Applied'.")
+                            try:
+                                total_prompt = sum(p for p, c in usage_records_no)
+                                total_completion = sum(c for p, c in usage_records_no)
+                                st.info(f"Token usage (this reclassification): prompt={total_prompt}, completion={total_completion}, total={total_prompt + total_completion}")
+                            except Exception:
+                                pass
