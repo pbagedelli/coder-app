@@ -835,12 +835,10 @@ else:
         classification_model = st.selectbox("Select Model for Final Classification:", ["gpt-4.1-mini", "gpt-4.1-nano"], index=0)
         
         # --- NEW: Checkboxes for classification mode ---
-        col_mode_1, col_mode_2, col_mode_3 = st.columns(3)
+        col_mode_1, col_mode_2 = st.columns(2)
         with col_mode_1:
             use_multilabel = st.checkbox("✅ Enable Multi-Label Classification", value=False, help="Allow assigning multiple codes to a single response. More comprehensive but can be slower.")
         with col_mode_2:
-            use_clustering = st.checkbox("⚡️ Accelerate with Semantic Clustering", value=True, help="Group similar responses to reduce API calls. Highly recommended.")
-        with col_mode_3:
             include_explanations = st.checkbox("💬 Include Explanations", value=True, help="If disabled, the model will not generate explanations to save tokens.")
 
         # Pre-calculate an estimated token usage for a single classification call
@@ -859,25 +857,16 @@ else:
 
         st.caption(f"Estimated tokens per classification call: {est_tokens_per_call if est_tokens_per_call is not None else 'N/A'}")
 
-        # Estimated embedding tokens (pre-clustering)
-        try:
-            base_unique_responses = df[column_to_code].dropna().unique().tolist()
-            string_responses = [str(item) for item in base_unique_responses]
-            unique_responses = [text for text in string_responses if text.strip()]
-            if use_clustering:
-                embedding_model = "text-embedding-3-small"
-                total_embed_tokens = sum(estimate_token_count(resp, embedding_model) for resp in unique_responses)
-            else:
-                total_embed_tokens = 0
-            st.caption(f"Estimated embedding tokens (pre-clustering): {total_embed_tokens}")
-        except Exception:
-            pass
+        # Clustering removed: no embedding estimate needed
 
-        # Estimated total classification tokens across mini-batches (upper bound if clustering is enabled)
+        # Estimated total classification tokens across mini-batches
         try:
             final_codebook_text_preview = reconstruct_codebook_text(st.session_state.structured_codebook)
+            base_unique_responses = df[column_to_code].dropna().unique().tolist()
+            string_responses = [str(item) for item in base_unique_responses]
+            unique_responses_for_est = [text for text in string_responses if text.strip()]
             # Build batched prompts as classify_batch does
-            batches_for_est = _chunk_list(unique_responses, BATCH_SIZE)
+            batches_for_est = _chunk_list(unique_responses_for_est, BATCH_SIZE)
             total_class_tokens = 0
             for batch in batches_for_est:
                 indexed = "\n".join([f"[{i}] \"{resp}\"" for i, resp in enumerate(batch)])
@@ -899,10 +888,7 @@ For uncovered responses, use an empty list for items.
 """
                 system_text = "You are a survey coding assistant."
                 total_class_tokens += estimate_chat_tokens(system_text, user_text, classification_model)
-            if use_clustering:
-                st.caption(f"Estimated total classification tokens (no-clustering upper bound): {total_class_tokens}")
-            else:
-                st.caption(f"Estimated total classification tokens: {total_class_tokens}")
+            st.caption(f"Estimated total classification tokens: {total_class_tokens}")
         except Exception:
             pass
 
@@ -925,15 +911,10 @@ For uncovered responses, use an empty list for items.
                 progress_bar = st.progress(0, text="Initializing classification...")
                 # Show an overall rough estimate of total prompt tokens before starting
                 try:
-                    if use_clustering and len(unique_responses) > 1:
-                        # Upper bound: cluster reps + outlier batch count; conservative estimate
-                        # We cannot know ahead of time; display per-call estimate only
-                        st.info(f"Per-call token estimate: ~{est_tokens_per_call if est_tokens_per_call is not None else 'N/A'} tokens")
-                    else:
-                        batches = _chunk_list(unique_responses, BATCH_SIZE)
-                        total_calls = len(batches)
-                        total_est = est_tokens_per_call * total_calls if est_tokens_per_call is not None else None
-                        st.info(f"Estimated total prompt tokens: {total_est if total_est is not None else 'N/A'} (across {total_calls} calls)")
+                    batches = _chunk_list(unique_responses, BATCH_SIZE)
+                    total_calls = len(batches)
+                    total_est = est_tokens_per_call * total_calls if est_tokens_per_call is not None else None
+                    st.info(f"Estimated total prompt tokens: {total_est if total_est is not None else 'N/A'} (across {total_calls} calls)")
                 except Exception:
                     pass
                 
@@ -963,69 +944,28 @@ For uncovered responses, use an empty list for items.
                     label_str = " | ".join(validated_labels) if validated_labels else "No Code Applied"
                     return {"Assigned Code": label_str, "Details": validated_details}
 
-                if use_clustering and len(unique_responses) > 1:
-                    # (Clustering logic remains the same, but now calls the unified classify_item function)
-                    progress_bar.progress(5, text="Step 1/4: Generating embeddings..."); embeddings = get_embeddings(unique_responses, st.session_state.api_key)
-                    if not embeddings: st.error("Failed to generate embeddings."); st.stop()
-                    progress_bar.progress(15, text="Step 2/4: Clustering responses..."); embeddings = normalize(np.array(embeddings)); db = DBSCAN(eps=0.3, min_samples=2, metric='cosine').fit(embeddings); labels = db.labels_
-                    cluster_ids = set(labels); n_clusters = len(cluster_ids) - (1 if -1 in labels else 0); outliers = [response for response, label in zip(unique_responses, labels) if label == -1]; n_outliers = len(outliers)
-                    outlier_batches = _chunk_list(outliers, BATCH_SIZE)
-                    total_api_calls = n_clusters + len(outlier_batches)
-                    if total_api_calls == 0: st.info("No new responses to classify."); st.stop()
-                    st.info(f"Found {n_clusters} groups and {n_outliers} unique. Total classifications needed: {total_api_calls}.")
-                    calls_made = 0; response_to_cluster = {response: label for response, label in zip(unique_responses, labels)}; classified_clusters = {}
-                    outlier_status = st.empty()
-                    for cluster_id in cluster_ids:
-                        if cluster_id != -1:
-                            representative = next(response for response, label in response_to_cluster.items() if label == cluster_id)
-                            code_str = classify_item(representative) # Call unified function
-                            classified_clusters[cluster_id] = code_str; calls_made += 1
-                            progress_bar.progress(15 + int(70 * (calls_made / total_api_calls)), text=f"Step 3/4: Classifying group {calls_made}/{total_api_calls}...")
-                    # Minibatch outliers (async)
-                    if outliers:
-                        batched = outlier_batches
-                        outlier_status.info(f"Launching {len(batched)} outlier batches asynchronously (up to {MAX_CONCURRENCY} concurrent)...")
-                        async_results = classify_batches_async(
-                            api_key=st.session_state.api_key,
-                            question=st.session_state.question_text,
-                            batched_responses=batched,
-                            codebook_text=final_codebook_text,
-                            model=classification_model,
-                            multi=use_multilabel,
-                            include_explanations=include_explanations,
-                            codebook_obj=st.session_state.structured_codebook
-                        )
-                        for batch_index, (batch, batch_results) in enumerate(zip(batched, async_results), start=1):
-                            for resp, res in zip(batch, batch_results):
-                                results_cache[resp] = res
-                            calls_made += 1
-                            progress_bar.progress(15 + int(70 * (calls_made / total_api_calls)), text=f"Step 3/4: Completed outlier batch {batch_index}/{len(batched)}")
-                    outlier_status.empty()
-                    for response, label in response_to_cluster.items():
-                        if label != -1: results_cache[response] = classified_clusters[label]
-                else:
-                    # Minibatch the full set
-                    batches = _chunk_list(unique_responses, BATCH_SIZE)
-                    total_batches = len(batches)
-                    processed = 0
-                    batch_status = st.empty()
-                    batch_status.info(f"Launching {total_batches} batches asynchronously (up to {MAX_CONCURRENCY} concurrent)...")
-                    async_results = classify_batches_async(
-                        api_key=st.session_state.api_key,
-                        question=st.session_state.question_text,
-                        batched_responses=batches,
-                        codebook_text=final_codebook_text,
-                        model=classification_model,
-                        multi=use_multilabel,
-                        include_explanations=include_explanations,
-                        codebook_obj=st.session_state.structured_codebook
-                    )
-                    for batch_index, (batch, batch_results) in enumerate(zip(batches, async_results), start=1):
-                        for resp, res in zip(batch, batch_results):
-                            results_cache[resp] = res
-                        processed += len(batch)
-                        progress_bar.progress(int(100 * processed / len(unique_responses)), text=f"Classifying unique responses {processed}/{len(unique_responses)} (batch {batch_index}/{total_batches})...")
-                    batch_status.empty()
+                # Minibatch the full set (clustering removed)
+                batches = _chunk_list(unique_responses, BATCH_SIZE)
+                total_batches = len(batches)
+                processed = 0
+                batch_status = st.empty()
+                batch_status.info(f"Launching {total_batches} batches asynchronously (up to {MAX_CONCURRENCY} concurrent)...")
+                async_results = classify_batches_async(
+                    api_key=st.session_state.api_key,
+                    question=st.session_state.question_text,
+                    batched_responses=batches,
+                    codebook_text=final_codebook_text,
+                    model=classification_model,
+                    multi=use_multilabel,
+                    include_explanations=include_explanations,
+                    codebook_obj=st.session_state.structured_codebook
+                )
+                for batch_index, (batch, batch_results) in enumerate(zip(batches, async_results), start=1):
+                    for resp, res in zip(batch, batch_results):
+                        results_cache[resp] = res
+                    processed += len(batch)
+                    progress_bar.progress(int(100 * processed / len(unique_responses)), text=f"Classifying unique responses {processed}/{len(unique_responses)} (batch {batch_index}/{total_batches})...")
+                batch_status.empty()
                 
                 progress_bar.progress(95, text="Step 4/4: Applying classifications...")
                 final_df = df.copy()
