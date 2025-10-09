@@ -16,7 +16,7 @@ except Exception:
 
 # --- Constants ---
 BATCH_SIZE = 64
-MAX_CONCURRENCY = 8
+MAX_CONCURRENCY = 16
 
 # --- Pydantic Models ---
 class Code(BaseModel):
@@ -107,6 +107,61 @@ def estimate_chat_tokens(system_text: str, user_text: str, model: str) -> int:
     # Minimal overhead per message; we keep it simple and robust
     return estimate_token_count(system_text, model) + estimate_token_count(user_text, model) + 6
 
+# --- Label Validation Functions ---
+def get_valid_codebook_labels(codebook_obj: Codebook) -> set[str]:
+    """Extract all valid code labels from the codebook."""
+    try:
+        if not codebook_obj or not getattr(codebook_obj, 'codes', None):
+            return set()
+        return {str(code.code).strip() for code in codebook_obj.codes if str(code.code).strip()}
+    except Exception:
+        return set()
+
+def find_closest_label(invalid_label: str, valid_labels: set[str]) -> str | None:
+    """Find the closest valid label using simple string similarity heuristics."""
+    if not invalid_label or not valid_labels:
+        return None
+    invalid_lower = invalid_label.lower().strip()
+    # 1) Exact case-insensitive
+    for valid in valid_labels:
+        if valid.lower().strip() == invalid_lower:
+            return valid
+    # 2) Partial contains
+    for valid in valid_labels:
+        v = valid.lower().strip()
+        if invalid_lower in v or v in invalid_lower:
+            return valid
+    # 3) Word overlap
+    invalid_words = set(invalid_lower.split())
+    best_match = None
+    best_score = 0
+    for valid in valid_labels:
+        v_words = set(valid.lower().split())
+        overlap = len(invalid_words.intersection(v_words))
+        if overlap > best_score and overlap > 0:
+            best_score = overlap
+            best_match = valid
+    return best_match if best_score > 0 else None
+
+def validate_and_fix_labels(assigned_labels: list[str], valid_labels: set[str]) -> list[str]:
+    """Validate labels against the codebook and attempt fuzzy fixes; drop if no match."""
+    if not assigned_labels:
+        return []
+    if not valid_labels:
+        return []
+    validated: list[str] = []
+    for label in assigned_labels:
+        raw = str(label).strip()
+        if not raw:
+            continue
+        if raw in valid_labels:
+            validated.append(raw)
+            continue
+        best = find_closest_label(raw, valid_labels)
+        if best:
+            validated.append(best)
+    return validated
+
 def reconstruct_codebook_text(codebook_obj: Codebook):
     if not codebook_obj or not codebook_obj.codes: return ""
     return "\n".join([f"- Code: {item.code}\n  Description: {item.description}" for item in codebook_obj.codes]).strip()
@@ -135,6 +190,8 @@ def classify_response_prompt(question, response, codebook_text, include_explanat
     Question: "{question}"
     Codebook:\n---\n{codebook_text}\n---
     Response: "{response}"
+    
+    IMPORTANT: The "label" field MUST be exactly one of the code names from the codebook above. Do not create new labels or modify existing ones.
     Return ONLY a JSON object with this schema:
     {{
       "items": [
@@ -152,6 +209,8 @@ def classify_response_prompt_multi(question, response, codebook_text, include_ex
     Question: "{question}"
     Codebook:\n---\n{codebook_text}\n---
     Response: "{response}"
+    
+    IMPORTANT: The "label" field MUST be exactly one of the code names from the codebook above. Do not create new labels or modify existing ones.
     Return ONLY a JSON object with this schema:
     {{
       "items": [
@@ -399,7 +458,7 @@ If all responses are covered, return {{ "uncovered": [] }}.
 def _chunk_list(items: list[str], size: int) -> list[list[str]]:
     return [items[i:i+size] for i in range(0, len(items), size)]
 
-def classify_batch(api_key: str, question: str, responses: list[str], codebook_text: str, model: str, multi: bool, include_explanations: bool) -> list[dict]:
+def classify_batch(api_key: str, question: str, responses: list[str], codebook_text: str, model: str, multi: bool, include_explanations: bool, codebook_obj: Codebook | None = None) -> list[dict]:
     if not responses:
         return []
     indexed = "\n".join([f"[{i}] \"{resp}\"" for i, resp in enumerate(responses)])
@@ -411,6 +470,7 @@ def classify_batch(api_key: str, question: str, responses: list[str], codebook_t
 Question: "{question}"
 Codebook:\n---\n{codebook_text}\n---
 Responses (indexed):\n{indexed}
+IMPORTANT: The "label" field MUST be exactly one of the code names from the codebook above. Do not create new labels or modify existing ones.
 Return ONLY JSON with this schema:
 {{
   "results": [
@@ -425,26 +485,35 @@ For uncovered responses, use an empty list for items.
     aligned: list[dict] = [{"Assigned Code": "No Code Applied", "Details": []} for _ in responses]
     if not parsed or not parsed.results:
         return aligned
+    # Prepare valid labels from provided codebook
+    valid_labels = get_valid_codebook_labels(codebook_obj) if codebook_obj else set()
+
     for item in parsed.results:
         if not isinstance(item.index, int) or item.index < 0 or item.index >= len(responses):
             continue
-        labels = [ev.label for ev in (item.items or [])]
-        label_str = " | ".join(labels) if labels else "No Code Applied"
-        details = [{
-            "label": ev.label,
-            "fragment": ev.fragment,
-            "pertinence": ev.pertinence,
-            "explanation": ev.explanation if include_explanations else None
-        } for ev in (item.items or [])]
-        aligned[item.index] = {"Assigned Code": label_str, "Details": details}
+        # Validate labels using codebook
+        original_labels = [ev.label for ev in (item.items or [])]
+        validated_labels = validate_and_fix_labels(original_labels, valid_labels) if valid_labels else original_labels
+        
+        validated_details = []
+        for i, ev in enumerate(item.items or []):
+            if i < len(validated_labels):
+                validated_details.append({
+                    "label": validated_labels[i],
+                    "fragment": ev.fragment,
+                    "pertinence": ev.pertinence,
+                    "explanation": ev.explanation if include_explanations else None
+                })
+        label_str = " | ".join(validated_labels) if validated_labels else "No Code Applied"
+        aligned[item.index] = {"Assigned Code": label_str, "Details": validated_details}
     return aligned
 
-def classify_batches_async(api_key: str, question: str, batched_responses: list[list[str]], codebook_text: str, model: str, multi: bool, include_explanations: bool) -> list[list[dict]]:
+def classify_batches_async(api_key: str, question: str, batched_responses: list[list[str]], codebook_text: str, model: str, multi: bool, include_explanations: bool, codebook_obj: Codebook | None = None) -> list[list[dict]]:
     if not batched_responses:
         return []
     results: list[list[dict]] = [None] * len(batched_responses)  # type: ignore
     def worker(idx: int, batch: list[str]) -> tuple[int, list[dict]]:
-        return idx, classify_batch(api_key, question, batch, codebook_text, model, multi, include_explanations)
+        return idx, classify_batch(api_key, question, batch, codebook_text, model, multi, include_explanations, codebook_obj)
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
         future_to_idx = {executor.submit(worker, i, b): i for i, b in enumerate(batched_responses)}
         for future in as_completed(future_to_idx):
@@ -878,15 +947,21 @@ For uncovered responses, use an empty list for items.
                         parsed = call_openai_api(st.session_state.api_key, "You are a survey coding assistant.", prompt, model=classification_model, pydantic_model=ClassificationOutput)
                     if not parsed or parsed.items is None:
                         return {"Assigned Code": "API_ERROR", "Details": []}
-                    labels = [item.label for item in parsed.items] if parsed.items else []
-                    label_str = " | ".join(labels) if labels else "No Code Applied"
-                    details = [{
-                        "label": item.label,
-                        "fragment": item.fragment,
-                        "pertinence": item.pertinence,
-                        "explanation": item.explanation if include_explanations else None
-                    } for item in parsed.items]
-                    return {"Assigned Code": label_str, "Details": details}
+                    # Validate using current session codebook
+                    valid_labels = get_valid_codebook_labels(st.session_state.structured_codebook)
+                    original_labels = [item.label for item in parsed.items] if parsed.items else []
+                    validated_labels = validate_and_fix_labels(original_labels, valid_labels)
+                    validated_details = []
+                    for i, it in enumerate(parsed.items or []):
+                        if i < len(validated_labels):
+                            validated_details.append({
+                                "label": validated_labels[i],
+                                "fragment": it.fragment,
+                                "pertinence": it.pertinence,
+                                "explanation": it.explanation if include_explanations else None
+                            })
+                    label_str = " | ".join(validated_labels) if validated_labels else "No Code Applied"
+                    return {"Assigned Code": label_str, "Details": validated_details}
 
                 if use_clustering and len(unique_responses) > 1:
                     # (Clustering logic remains the same, but now calls the unified classify_item function)
@@ -897,7 +972,7 @@ For uncovered responses, use an empty list for items.
                     outlier_batches = _chunk_list(outliers, BATCH_SIZE)
                     total_api_calls = n_clusters + len(outlier_batches)
                     if total_api_calls == 0: st.info("No new responses to classify."); st.stop()
-                    st.info(f"Found {n_clusters} groups and {n_outliers} unique outliers. Total classifications needed: {total_api_calls}.")
+                    st.info(f"Found {n_clusters} groups and {n_outliers} unique. Total classifications needed: {total_api_calls}.")
                     calls_made = 0; response_to_cluster = {response: label for response, label in zip(unique_responses, labels)}; classified_clusters = {}
                     outlier_status = st.empty()
                     for cluster_id in cluster_ids:
@@ -917,7 +992,8 @@ For uncovered responses, use an empty list for items.
                             codebook_text=final_codebook_text,
                             model=classification_model,
                             multi=use_multilabel,
-                            include_explanations=include_explanations
+                            include_explanations=include_explanations,
+                            codebook_obj=st.session_state.structured_codebook
                         )
                         for batch_index, (batch, batch_results) in enumerate(zip(batched, async_results), start=1):
                             for resp, res in zip(batch, batch_results):
@@ -941,7 +1017,8 @@ For uncovered responses, use an empty list for items.
                         codebook_text=final_codebook_text,
                         model=classification_model,
                         multi=use_multilabel,
-                        include_explanations=include_explanations
+                        include_explanations=include_explanations,
+                        codebook_obj=st.session_state.structured_codebook
                     )
                     for batch_index, (batch, batch_results) in enumerate(zip(batches, async_results), start=1):
                         for resp, res in zip(batch, batch_results):
@@ -995,13 +1072,17 @@ For uncovered responses, use an empty list for items.
                 c.strip()
                 for row in assigned_series
                 for c in re.split(r'\s*\|\s*', str(row))
-                if c.strip() and c not in ("No Code Applied", "API_ERROR")
+                if c.strip() and c != "API_ERROR"
             })
         except Exception:
             all_labels_view = []
+        # Include special option to filter by "No Code Applied"
+        filter_options = ["All labels"] + all_labels_view
+        if "No Code Applied" not in filter_options:
+            filter_options.append("No Code Applied")
         selected_label_filter = st.selectbox(
             "Filter table by label",
-            options=["All labels"] + all_labels_view,
+            options=filter_options,
             index=0,
             key="results_label_filter"
         )
@@ -1142,7 +1223,8 @@ For uncovered responses, use an empty list for items.
                                 codebook_text=cb_text,
                                 model=re_model,
                                 multi=re_multilabel,
-                                include_explanations=re_explanations
+                                include_explanations=re_explanations,
+                                codebook_obj=st.session_state.structured_codebook
                             )
                             # Flatten results and apply to the selected indices
                             flat_results = [res for batch_res in async_results for res in batch_res]
@@ -1160,3 +1242,60 @@ For uncovered responses, use an empty list for items.
                                 st.dataframe(df_view.loc[indices_to_reclassify, cols_to_show], use_container_width=True)
                             except Exception:
                                 pass
+
+        with st.expander("♻️ Reclassify 'No Code Applied' only"):
+            if not st.session_state.structured_codebook or not st.session_state.structured_codebook.codes:
+                st.warning("No codebook available.")
+            else:
+                # Controls for this reclassification
+                no_model = st.selectbox("Model:", ["gpt-4.1-mini", "gpt-4.1-nano", "gpt-4.1"], index=0, key="reclass_nocode_model")
+                no_multilabel = st.checkbox("Enable Multi-Label", value=True, key="reclass_nocode_multilabel")
+                no_explanations = st.checkbox("Include Explanations", value=True, key="reclass_nocode_explanations")
+                if st.button("Reclassify 'No Code Applied' Rows", use_container_width=True):
+                    # Determine text column to use
+                    col_to_show_local = st.session_state.get('column_to_code', None)
+                    if not col_to_show_local:
+                        try:
+                            col_to_show_local = column_to_code
+                        except Exception:
+                            col_to_show_local = None
+                    if col_to_show_local is None or col_to_show_local not in st.session_state.classified_df.columns:
+                        st.error("No valid text column available.")
+                    else:
+                        df_view = st.session_state.classified_df
+                        indices_to_reclassify = []
+                        texts_to_reclassify = []
+                        for idx, row in df_view.iterrows():
+                            assigned = str(row.get('Assigned Code', '') or '')
+                            if assigned == "No Code Applied":
+                                indices_to_reclassify.append(idx)
+                                texts_to_reclassify.append(str(row[col_to_show_local]))
+                        if not indices_to_reclassify:
+                            st.info("No rows currently labeled 'No Code Applied'.")
+                        else:
+                            cb_text = reconstruct_codebook_text(st.session_state.structured_codebook)
+                            batches = _chunk_list(texts_to_reclassify, BATCH_SIZE)
+                            total_batches = len(batches)
+                            progress_bar = st.progress(0, text="Reclassifying 'No Code Applied' rows in batches...")
+                            batch_status = st.empty()
+                            batch_status.info(f"Launching {total_batches} batches asynchronously (up to {MAX_CONCURRENCY} concurrent)...")
+                            async_results = classify_batches_async(
+                                api_key=st.session_state.api_key,
+                                question=st.session_state.question_text,
+                                batched_responses=batches,
+                                codebook_text=cb_text,
+                                model=no_model,
+                                multi=no_multilabel,
+                                include_explanations=no_explanations,
+                                codebook_obj=st.session_state.structured_codebook
+                            )
+                            # Flatten results and apply to the selected indices
+                            flat_results = [res for batch_res in async_results for res in batch_res]
+                            for i, (row_idx, res) in enumerate(zip(indices_to_reclassify, flat_results), start=1):
+                                df_view.at[row_idx, 'Assigned Code'] = res.get('Assigned Code', '')
+                                df_view.at[row_idx, 'Assigned Details'] = res.get('Details', [])
+                                if total_batches > 0:
+                                    progress_bar.progress(int(100 * i / len(indices_to_reclassify)), text=f"Reclassifying rows {i}/{len(indices_to_reclassify)} (batch progress)")
+                            st.session_state.classified_df = df_view
+                            progress_bar.progress(100, text="Reclassification complete!")
+                            st.success("Reclassification complete! Updated only rows previously labeled 'No Code Applied'.")
