@@ -64,7 +64,7 @@ initialize_state()
 # --- Helper & API Functions ---
 def load_data(uploaded_file):
     try:
-        if uploaded_file.name.endswith('.csv'): return pd.read_csv(uploaded_file, encoding='latin1')
+        if uploaded_file.name.endswith('.csv'): return pd.read_csv(uploaded_file)
         elif uploaded_file.name.endswith(('.xls', '.xlsx')): return pd.read_excel(uploaded_file)
     except Exception as e: st.error(f"Error loading file: {e}"); return None
 
@@ -1185,7 +1185,7 @@ For uncovered responses, use an empty list for items.
                     options=all_labels,
                     key="reclass_included_rows"
                 )
-                re_model = st.selectbox("Model:", ["gpt-4.1-mini", "gpt-4.1-nano"], index=0, key="reclass_rows_model")
+                re_model = st.selectbox("Model:", ["gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano"], index=0, key="reclass_rows_model")
                 re_multilabel = st.checkbox("Enable Multi-Label", value=True, key="reclass_rows_multilabel")
                 re_explanations = st.checkbox("Include Explanations", value=True, key="reclass_rows_explanations")
                 include_no_code_rows = st.checkbox("Include rows currently labeled 'No Code Applied'", value=True, key="reclass_include_no_code")
